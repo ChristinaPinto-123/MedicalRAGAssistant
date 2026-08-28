@@ -1,5 +1,5 @@
+import re
 import torch
-import spacy
 from typing import List, Tuple
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from app.schemas import VerifiedClaim, SourceCitation
@@ -10,19 +10,11 @@ class MedicalNLIVerifier:
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModelForSequenceClassification.from_pretrained(model_name).to(self.device)
         self.model.eval()
-        
-        # SpaCy for sentence/claim extraction
-        try:
-            self.nlp = spacy.load("en_core_web_sm")
-        except OSError:
-            import spacy.cli
-            spacy.cli.download("en_core_web_sm")
-            self.nlp = spacy.load("en_core_web_sm")
 
     def decompose_claims(self, text: str) -> List[str]:
-        """Splits synthesized clinical text into atomic sentences/claims."""
-        doc = self.nlp(text)
-        return [sent.text.strip() for sent in doc.sents if len(sent.text.strip()) > 10]
+        """Splits text into atomic sentences without external spaCy dependencies."""
+        sentences = re.split(r'(?<=[.!?]) +', text)
+        return [s.strip() for s in sentences if len(s.strip()) > 10]
 
     def verify_claim(self, premise: str, hypothesis: str) -> Tuple[str, float]:
         """Runs NLI inference: returns label and entailment probability."""
@@ -38,7 +30,6 @@ class MedicalNLIVerifier:
             outputs = self.model(**inputs)
             probs = torch.softmax(outputs.logits, dim=1)[0]
 
-        # DeBERTa MNLI class mapping: 0 -> Entailment, 1 -> Neutral, 2 -> Contradiction
         entailment_prob = probs[0].item()
         contradiction_prob = probs[2].item()
 
@@ -63,10 +54,8 @@ class MedicalNLIVerifier:
         entailed_count = 0
 
         for claim in claims:
-            # Map claim to best source or overall retrieved context
             status, score = self.verify_claim(combined_premise, claim)
             
-            # Simple heuristic: find if a specific citation ID is mentioned
             cited_id = "General Context"
             for src in sources:
                 if src.source_id in claim:
