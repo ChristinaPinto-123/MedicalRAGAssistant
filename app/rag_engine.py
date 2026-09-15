@@ -20,11 +20,14 @@ class ClinicalRAGEngine:
         # Route OpenAI provider directly to the Azure/GitHub Models endpoint
         api_base = os.getenv("OPENAI_BASE_URL", "https://models.inference.ai.azure.com")
 
+        # Use explicit base_url and api_base for compatibility across LlamaIndex versions
         Settings.llm = OpenAI(
-            model=os.getenv("LLM_MODEL", "gpt-4o"),
+            model="gpt-4o",
             api_key=token,
-            api_base=api_base,
-            temperature=0.0
+            api_base="https://models.inference.ai.azure.com",
+            additional_kwargs={"base_url": "https://models.inference.ai.azure.com"},
+            temperature=0.0,
+            timeout=60.0
         )
         Settings.embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-small-en-v1.5")
         Settings.node_parser = SentenceSplitter(chunk_size=512, chunk_overlap=64)
