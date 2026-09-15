@@ -12,12 +12,12 @@ class MedicalNLIVerifier:
         self.model.eval()
 
     def decompose_claims(self, text: str) -> List[str]:
-        """Splits text into atomic sentences without external spaCy dependencies."""
-        sentences = re.split(r'(?<=[.!?]) +', text)
-        return [s.strip() for s in sentences if len(s.strip()) > 10]
+        """Splits synthesized clinical text into distinct atomic sentences."""
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        return [s.strip() for s in sentences if len(s.strip()) > 15]
 
     def verify_claim(self, premise: str, hypothesis: str) -> Tuple[str, float]:
-        """Runs NLI inference: returns label and entailment probability."""
+        """Classifies relation between retrieved clinical context and generated claim."""
         inputs = self.tokenizer(
             premise,
             hypothesis,
@@ -28,17 +28,20 @@ class MedicalNLIVerifier:
 
         with torch.no_grad():
             outputs = self.model(**inputs)
-            probs = torch.softmax(outputs.logits, dim=1)[0]
+            probs = torch.softmax(outputs.logits, dim=-1)[0]
 
-        entailment_prob = probs[0].item()
-        contradiction_prob = probs[2].item()
+        # Class indexing for MoritzLaurer MNLI models:
+        # Index 0: Entailment, Index 1: Neutral, Index 2: Contradiction
+        entailment = probs[0].item()
+        neutral = probs[1].item()
+        contradiction = probs[2].item()
 
-        if entailment_prob >= 0.70:
-            return "Entailed", float(entailment_prob)
-        elif contradiction_prob >= 0.50:
-            return "Contradicted", float(contradiction_prob)
+        if entailment >= 0.70:
+            return "Entailed", float(entailment)
+        elif contradiction >= 0.40:
+            return "Contradicted", float(contradiction)
         else:
-            return "Neutral / Unverified", float(probs[1].item())
+            return "Neutral / Unverified", float(neutral)
 
     def validate_generation(
         self,
@@ -46,20 +49,21 @@ class MedicalNLIVerifier:
         sources: List[SourceCitation],
         threshold: float
     ) -> Tuple[List[VerifiedClaim], float]:
-        """Validates all claims against aggregated source evidence."""
+        """Validates all synthesized claims against retrieved citation snippets."""
         claims = self.decompose_claims(synthesized_text)
         combined_premise = " ".join([f"[{s.source_id}] {s.snippet}" for s in sources])
-        
+
         verified_claims: List[VerifiedClaim] = []
         entailed_count = 0
 
         for claim in claims:
             status, score = self.verify_claim(combined_premise, claim)
-            
-            cited_id = "General Context"
+
+            # Match explicitly referenced source IDs if present
+            matched_id = "General Context"
             for src in sources:
                 if src.source_id in claim:
-                    cited_id = src.source_id
+                    matched_id = src.source_id
                     break
 
             if status == "Entailed" and score >= threshold:
@@ -68,7 +72,7 @@ class MedicalNLIVerifier:
             verified_claims.append(
                 VerifiedClaim(
                     claim_text=claim,
-                    cited_source_id=cited_id,
+                    cited_source_id=matched_id,
                     nli_status=status,
                     entailment_score=round(score, 4)
                 )

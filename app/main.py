@@ -1,96 +1,88 @@
-from dotenv import load_dotenv
-load_dotenv()
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, status
+from dotenv import load_dotenv
+
 from app.schemas import MedicalQueryRequest, MedicalQueryResponse
 from app.rag_engine import ClinicalRAGEngine
 from app.nli_validator import MedicalNLIVerifier
 
-state = {}
+load_dotenv()
+
+pipeline_state = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Pre-load embedding, LLM settings, and NLI models on startup
-    state["rag_engine"] = ClinicalRAGEngine()
-    state["nli_verifier"] = MedicalNLIVerifier()
+    # Initialize heavy models on startup into memory
+    pipeline_state["rag_engine"] = ClinicalRAGEngine()
+    pipeline_state["nli_verifier"] = MedicalNLIVerifier()
     yield
-    state.clear()
+    pipeline_state.clear()
 
 app = FastAPI(
-    title="Clinical Evidence RAG Engine",
-    description="Evidence-grounded medical question answering with NLI-based claim attribution and confidence scoring",
+    title="Clinical Evidence RAG API",
+    description="Asynchronous RAG with automated NLI-based claim validation and evidence ranking.",
     version="1.0.0",
     lifespan=lifespan
 )
-
-def compute_confidence(
-    retrieval_score: float,
-    grounding_ratio: float,
-    sources: list
-) -> tuple[float, str]:
-    """Calculates weighted composite confidence score."""
-    avg_evidence_weight = (
-        sum(s.evidence_level_weight for s in sources) / len(sources) if sources else 0.5
-    )
-    
-    # Weights: 30% retrieval similarity, 50% NLI claim grounding, 20% evidence hierarchy
-    composite = (0.30 * retrieval_score) + (0.50 * grounding_ratio) + (0.20 * avg_evidence_weight)
-    composite = round(min(max(composite, 0.0), 1.0), 3)
-
-    if composite >= 0.85:
-        tier = "High"
-    elif composite >= 0.65:
-        tier = "Moderate"
-    else:
-        tier = "Low / Needs Review"
-
-    return composite, tier
 
 @app.post(
     "/api/v1/query",
     response_model=MedicalQueryResponse,
     status_code=status.HTTP_200_OK,
-    summary="Query Medical Knowledge Base"
+    summary="Execute grounded medical query with citation verification"
 )
-async def query_medical_rag(payload: MedicalQueryRequest):
+async def query_clinical_rag(request: MedicalQueryRequest):
+    rag_engine: ClinicalRAGEngine = pipeline_state.get("rag_engine")
+    nli_verifier: MedicalNLIVerifier = pipeline_state.get("nli_verifier")
+
+    if not rag_engine or not nli_verifier:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Pipeline engines are not initialized."
+        )
+
     try:
-        rag: ClinicalRAGEngine = state["rag_engine"]
-        nli: MedicalNLIVerifier = state["nli_verifier"]
-
-        # 1. Retrieve & Synthesize
-        raw_answer, sources, retrieval_score = rag.retrieve_and_synthesize(
-            query=payload.query,
-            top_k=payload.max_evidence_nodes
+        # Step 1: Retrieval & LLM Generation
+        answer, sources, retrieval_sim = rag_engine.retrieve_and_synthesize(
+            query_str=request.query,
+            top_k=request.max_evidence_nodes
         )
 
-        # 2. Deconstruct and Validate Claims via NLI
-        verified_claims, grounding_ratio = nli.validate_generation(
-            synthesized_text=raw_answer,
+        # Step 2: NLI Verification across claims
+        verified_claims, grounding_ratio = nli_verifier.validate_generation(
+            synthesized_text=answer,
             sources=sources,
-            threshold=payload.entailment_threshold
+            threshold=request.entailment_threshold
         )
 
-        # 3. Formulate Composite Score
-        confidence_score, confidence_tier = compute_confidence(
-            retrieval_score=retrieval_score,
-            grounding_ratio=grounding_ratio,
-            sources=sources
+        # Step 3: Composite Confidence Scoring
+        # 40% NLI Grounding + 35% Retrieval Relevance + 25% Hierarchy Weight
+        mean_evidence_hierarchy = (
+            sum(s.evidence_level_weight for s in sources) / max(len(sources), 1)
         )
+        composite_confidence = (
+            (0.40 * grounding_ratio) +
+            (0.35 * retrieval_sim) +
+            (0.25 * mean_evidence_hierarchy)
+        )
+
+        if composite_confidence >= 0.80:
+            tier = "High"
+        elif composite_confidence >= 0.60:
+            tier = "Moderate"
+        else:
+            tier = "Low / Needs Review"
 
         return MedicalQueryResponse(
-            synthesized_answer=raw_answer,
+            synthesized_answer=answer,
             verified_claims=verified_claims,
             sources=sources,
-            confidence_score=confidence_score,
-            confidence_tier=confidence_tier
+            confidence_score=round(composite_confidence, 4),
+            confidence_tier=tier
         )
 
-    except Exception as e:
+    except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Medical RAG pipeline failure: {str(e)}"
+            detail=f"Clinical RAG processing error: {str(exc)}"
         )
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
